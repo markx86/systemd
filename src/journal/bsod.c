@@ -25,6 +25,8 @@
 #include "terminal-util.h"
 
 static bool arg_continuous = false;
+static char background_color = '4';
+static char foreground_color = '7';
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
@@ -38,10 +40,12 @@ static int help(void) {
                "%sFilter the journal to fetch the first message from the\n"
                "current boot with an emergency log level and displays it\n"
                "as a string and a QR code.\n\n%s"
-               "   -h --help            Show this help\n"
-               "      --version         Show package version\n"
-               "   -c --continuous      Make systemd-bsod wait continuously\n"
-               "                        for changes in the journal\n"
+               "   -h --help         Show this help\n"
+               "      --version      Show package version\n"
+               "   -c --continuous   Make systemd-bsod wait continuously\n"
+               "                     for changes in the journal\n"
+               "   -b --background=  Set the background color. Valid values are 0-7\n"
+               "   -f --foreground=  Set the foreground color. Valid values are 0-7\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
@@ -135,6 +139,8 @@ static int find_next_free_vt(int fd, int *ret_free_vt, int *ret_original_vt) {
 static int display_emergency_message_fullscreen(const char *message) {
         int r, ret = 0, free_vt = 0, original_vt = 0;
         unsigned qr_code_start_row = 1, qr_code_start_column = 1;
+        char ansi_text_color[] = ANSI_WHITE ANSI_BACKGROUND_BLUE;
+        char ansi_clear_terminal[] = ANSI_BACKGROUND_BLUE ANSI_HOME_CLEAR;
         char tty[STRLEN("/dev/tty") + DECIMAL_STR_MAX(int) + 1];
         _cleanup_close_ int fd = -EBADF;
         _cleanup_fclose_ FILE *stream = NULL;
@@ -168,13 +174,20 @@ static int display_emergency_message_fullscreen(const char *message) {
         if (ioctl(fd, VT_ACTIVATE, free_vt + 1) < 0)
                 return log_error_errno(errno, "Failed to activate tty: %m");
 
-        r = loop_write(fd, ANSI_BACKGROUND_BLUE ANSI_HOME_CLEAR, SIZE_MAX);
+        ansi_clear_terminal[3] = background_color;
+        r = loop_write(fd, ansi_clear_terminal, SIZE_MAX);
         if (r < 0)
                 log_warning_errno(r, "Failed to clear terminal, ignoring: %m");
 
         r = set_terminal_cursor_position(fd, 2, 4);
         if (r < 0)
                 log_warning_errno(r, "Failed to move terminal cursor position, ignoring: %m");
+
+        ansi_text_color[5] = foreground_color;
+        ansi_text_color[10] = background_color;
+        r = loop_write(fd, ansi_text_color, SIZE_MAX);
+        if (r < 0)
+                log_warning_errno(r, "Failed to set terminal foreground color, ignoring: %m");
 
         r = loop_write(fd, "The current boot has failed!", SIZE_MAX);
         if (r < 0) {
@@ -232,9 +245,11 @@ static int parse_argv(int argc, char * argv[]) {
         };
 
         static const struct option options[] = {
-                { "help",       no_argument, NULL, 'h'         },
-                { "version",    no_argument, NULL, ARG_VERSION },
-                { "continuous", no_argument, NULL, 'c'         },
+                { "help",       no_argument,       NULL, 'h'         },
+                { "version",    no_argument,       NULL, ARG_VERSION },
+                { "continuous", no_argument,       NULL, 'c'         },
+                { "background", required_argument, NULL, 'b'         },
+                { "foreground", required_argument, NULL, 'f'         },
                 {}
         };
 
@@ -243,7 +258,7 @@ static int parse_argv(int argc, char * argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hc", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hcb:f:", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -259,6 +274,20 @@ static int parse_argv(int argc, char * argv[]) {
 
                 case '?':
                         return -EINVAL;
+
+                case 'b':
+                case 'f':
+                        if (strlen(optarg) != 1 || *optarg < '0' || *optarg > '7') {
+                                printf("Invalid color code %s. It must be between 0 and 7.\n", optarg);
+                                return 0;
+                        }
+                        if (c == 'f')
+                                foreground_color = *optarg;
+                        else if (c == 'b')
+                                background_color = *optarg;
+                        else
+                                assert_not_reached();
+                        break;
 
                 default:
                         assert_not_reached();
