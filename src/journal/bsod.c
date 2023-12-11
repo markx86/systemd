@@ -23,10 +23,11 @@
 #include "signal-util.h"
 #include "sysctl-util.h"
 #include "terminal-util.h"
+#include "parse-util.h"
 
 static bool arg_continuous = false;
-static char background_color = '4';
-static char foreground_color = '7';
+static char background_color[32] = "\x1B[44m";
+static char foreground_color[32] = "\x1B[37m";
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
@@ -139,8 +140,6 @@ static int find_next_free_vt(int fd, int *ret_free_vt, int *ret_original_vt) {
 static int display_emergency_message_fullscreen(const char *message) {
         int r, ret = 0, free_vt = 0, original_vt = 0;
         unsigned qr_code_start_row = 1, qr_code_start_column = 1;
-        char ansi_text_color[] = ANSI_WHITE ANSI_BACKGROUND_BLUE;
-        char ansi_clear_terminal[] = ANSI_BACKGROUND_BLUE ANSI_HOME_CLEAR;
         char tty[STRLEN("/dev/tty") + DECIMAL_STR_MAX(int) + 1];
         _cleanup_close_ int fd = -EBADF;
         _cleanup_fclose_ FILE *stream = NULL;
@@ -174,8 +173,11 @@ static int display_emergency_message_fullscreen(const char *message) {
         if (ioctl(fd, VT_ACTIVATE, free_vt + 1) < 0)
                 return log_error_errno(errno, "Failed to activate tty: %m");
 
-        ansi_clear_terminal[3] = background_color;
-        r = loop_write(fd, ansi_clear_terminal, SIZE_MAX);
+        r = loop_write(fd, background_color, SIZE_MAX);
+        if (r < 0)
+                log_warning_errno(r, "Failed to set background color, ignoring: %m");
+
+        r = loop_write(fd, ANSI_HOME_CLEAR, SIZE_MAX);
         if (r < 0)
                 log_warning_errno(r, "Failed to clear terminal, ignoring: %m");
 
@@ -183,9 +185,7 @@ static int display_emergency_message_fullscreen(const char *message) {
         if (r < 0)
                 log_warning_errno(r, "Failed to move terminal cursor position, ignoring: %m");
 
-        ansi_text_color[5] = foreground_color;
-        ansi_text_color[10] = background_color;
-        r = loop_write(fd, ansi_text_color, SIZE_MAX);
+        r = loop_write(fd, foreground_color, SIZE_MAX);
         if (r < 0)
                 log_warning_errno(r, "Failed to set terminal foreground color, ignoring: %m");
 
@@ -238,6 +238,109 @@ cleanup:
         return ret;
 }
 
+static int parse_color(char *argument, int is_background) {
+        int commas = 0, arg_len = 0;
+        char (*ansi_color)[32] = is_background ? &background_color : &foreground_color;
+
+        assert(argument != NULL);
+
+        arg_len = strlen(argument);
+        if (arg_len < 1) {
+                printf("Colors string cannot be empty.\n");
+                return -EINVAL;
+        }
+
+        for (char *comma = argument; (comma = strchr(comma, ',')) != NULL; ++commas)
+                ++comma;
+
+        /*
+         * commas == 0 --> ANSI 3/4-bit color
+         * commas == 2 --> ANSI 24-bit color
+         */
+        if (commas != 0 && commas != 2) {
+                printf("The color string can either be a list of comma separated\n"
+                       "RGB components, or a number between 0-7, possibly\n"
+                       "preceded by either a 1 or a 0, for the brighter\n"
+                       "and darker version of the color, respectively.\n");
+                return -EINVAL;
+        }
+
+        if (commas == 0) {
+
+                int color;
+
+                if (arg_len > 2) {
+                        printf("Invalid ANSI color %s.\n"
+                               "Valid ANSI colors are between 0-7.\n",
+                               argument);
+                        return -EINVAL;
+                }
+                if (arg_len == 2 && argument[0] > '1') {
+                        printf("Invalid ANSI color modifier %c.\n"
+                               "The available modifiers are 1 and 0, for the brighter and darker\n"
+                               "version of the color, respectively.\n",
+                               argument[0]);
+                        return -EINVAL;
+                }
+
+                color = argument[arg_len == 2] - '0';
+                if (color < 0 || color > 7) {
+                        printf("Invalid ANSI color %d.\n"
+                               "Valid ANSI colors are between 0-7.\n",
+                               color);
+                        return -EINVAL;
+                }
+
+                color += arg_len == 2 && argument[0] == '1' ? 90 : 30;
+                if (is_background)
+                        color += 10;
+
+                xsprintf(*ansi_color, "\x1B[%dm", color);
+
+        } else if (commas == 2) {
+
+                char color_string[4] = {0};
+                int component[3] = {0};
+                int c = 0, i = 0, r = 0;
+
+                for (; i < arg_len; ++i) {
+                        if (r >= 4) {
+                                printf("Invalid RGB color: %s.\n"
+                                       "Every component must be between 0-255.\n",
+                                       argument);
+                                return -EACCES;
+                        }
+
+                        if (argument[i] == ',' || argument[i] == '\0') {
+                                color_string[r] = '\0';
+                                r = safe_atoi(color_string, &component[c]);
+                                if (r < 0) {
+                                        printf("Invalid RGB component: %s.\n"
+                                               "All color components must be numbers between 0-255.\n",
+                                               color_string);
+                                        return -EINVAL;
+                                }
+                                if (component[c] > 255 || component[c] < 0) {
+                                        printf("Invalid RGB component: %d.\n"
+                                               "All color components must be numbers between 0-255.\n",
+                                               component[c]);
+                                        return -EINVAL;
+                                }
+                                r = 0;
+                                ++c;
+                        } else
+                                color_string[r++] = argument[i];
+                }
+
+                xsprintf(*ansi_color, "\x1B[%c8;2;%d;%d;%dm",
+                         is_background ? '4' : '3',
+                         component[0], component[1], component[2]);
+
+        }
+
+        return 0;
+}
+
 static int parse_argv(int argc, char * argv[]) {
 
         enum {
@@ -253,7 +356,7 @@ static int parse_argv(int argc, char * argv[]) {
                 {}
         };
 
-        int c;
+        int c, r;
 
         assert(argc >= 0);
         assert(argv);
@@ -277,16 +380,9 @@ static int parse_argv(int argc, char * argv[]) {
 
                 case 'b':
                 case 'f':
-                        if (strlen(optarg) != 1 || *optarg < '0' || *optarg > '7') {
-                                printf("Invalid color code %s. It must be between 0 and 7.\n", optarg);
-                                return 0;
-                        }
-                        if (c == 'f')
-                                foreground_color = *optarg;
-                        else if (c == 'b')
-                                background_color = *optarg;
-                        else
-                                assert_not_reached();
+                        r = parse_color(optarg, c == 'b');
+                        if (r < 0)
+                                return r;
                         break;
 
                 default:
